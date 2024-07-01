@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import warnings
 import math
 import torch
 import torch.nn.functional as F
@@ -6,15 +7,49 @@ from torch.cuda.amp import custom_fwd, custom_bwd
 import triton
 import triton.language as tl
 
-@triton.autotune(
-    configs=[
+def config_prune(configs):
+
+    if torch.version.hip:
+        try:
+            # set warp size based on gcn architecure 
+            gcn_arch_name = torch.cuda.get_device_properties(0).gcnArchName
+            if "gfx10" in gcn_arch_name or "gfx11" in gcn_arch_name:
+                # radeon
+                warp_size = 32
+            else:
+                # instinct
+                warp_size = 64
+        except AttributeError as e:
+            # fall back to crude method to set warp size
+            device_name = torch.cuda.get_device_properties(0).name
+            if 'instinct' in device_name.lower():
+                warp_size = 64
+            else:
+                warp_size = 32
+            warnings.warn(f"{e}, warp size set to {warp_size} based on device name: {device_name}", UserWarning)
+
+    else:
+        # cuda 
+        warp_size = 32    
+
+    max_block_sz = 1024
+    max_num_warps = max_block_sz // warp_size
+    pruned_configs = [config for config in configs if config.num_warps <= max_num_warps]
+    return pruned_configs
+
+configs_autotune = [
         triton.Config({}, num_warps=1),
         triton.Config({}, num_warps=2),
         triton.Config({}, num_warps=4),
         triton.Config({}, num_warps=8),
         triton.Config({}, num_warps=16),
         triton.Config({}, num_warps=32),
-    ],
+        ]
+
+pruned_configs_autotune = config_prune(configs_autotune)
+
+@triton.autotune(
+    configs = pruned_configs_autotune,
     key=["N"],
 )
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
@@ -47,14 +82,7 @@ def _l2_norm_fwd_1pass_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1),
-        triton.Config({}, num_warps=2),
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-        triton.Config({}, num_warps=16),
-        triton.Config({}, num_warps=32),
-    ],
+    configs=pruned_configs_autotune,
     key=["N"],
 )
 # @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
